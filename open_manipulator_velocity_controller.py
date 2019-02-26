@@ -92,6 +92,7 @@ class VelocityController(object):
         with self.mutex:
             self.T_goal = goal_tmp
         # self.joint_com_published = True
+        return self.T_goal
 
     def get_phi(self, R_d, R_cur):
         phi = 0.5 * (np.cross(R_d[0:3, 0], R_cur[0:3, 0]) + np.cross(R_d[0:3, 1], R_cur[0:3, 1]) + np.cross(R_d[0:3, 2], R_cur[0:3, 2]))

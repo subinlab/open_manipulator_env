@@ -35,19 +35,22 @@ from gym.envs.registration import register
 # Global variables
 # -------------------------
 ACTION_DIM = 3  # Cartesian
-OBS_DIM = (100,100,3)  # POMDP
-STATE_DIM = 24  # MDP
+
+
+register(
+        id='FetchReach-v0',
+        entry_point='openai_ros:task_envs.fetch_reach.fetch_reach.FetchReachEnv',
+        timestep_limit=1000,
+    )
 
 
 class RobotEnv(gym.GoalEnv):
-    def __init__(self, max_steps=700, n_actions, isdagger=False, isPOMDP=False, train_indicator=0):
-        rospy.init_node('robotEnv')
+    def __init__(self, max_steps=700, ACTION_DIM, train_indicator=0):
+        rospy.init_node('gym_environment/open_manipulator')
 
         self.train_indicator = train_indicator # 0: Train 1:Test
-        self.is_dagger = isdagger
-        self.is_POMDP = isPOMDP
 
-        # Publihser nodes
+         # Publihser nodes
         # -------------------------
         self.pub_gripper_position = rospy.Publisher('/open_manipulator/gripper_position/command', Float64, queue_size=1)
         self.pub_gripper_sub_position = rospy.Publisher('/open_manipulator/gripper_sub_position/command', Float64, queue_size=1)
@@ -76,44 +79,38 @@ class RobotEnv(gym.GoalEnv):
         self.gripper_orientiation = KinematicsPose().pose.orientation  # [x, y, z, w] quaternion orientation
 
 
-        # To apply action
-        # self.cartesian_command = [0.0, 0.0, 0.0]  # [x, y, z] cartesian position
-        # self.cartesian_command = Pose().position
-        # self.fixed_orientation = Pose().orientation
+
+        # for compatiability
+        self.action_space = spaces.Box(-1., 1., shape=(ACTION_DIM,), dtype='float32')
+        self.observation_space = spaces.Dict(dict(
+
+            observation=spaces.Box(-np.inf, np.inf, shape=obs['observation'].shape, dtype='float32'),
+        ))
 
 
-        # openai gym style variables
+        # env variables
         # -------------------------
-        self.viewer = None
-        self._viewers = {}
-        # self.medatata
+
+        self.done = False
+        self.successCount =0
+        self.terminateCount =0
+        self.reward = 0
+
+        self.joints_position, self.joints_velocity, self.joints_effort = self._get_joint_obs()
+        self.obj_position = self._get_target_obj_obs()        
 
         self.seed()
         self._env_setup()  # Initial configuration of the environment.
-        self.goal = self._sample_goal()  # Define in the FetchEnv
-        # self.obs = self._get_obs()
-        self.obs_joints_position, self.obs_joints_velocity, self.obs_joints_effort = self._get_joint_obs()
-        self.destPos = self._get_target_obj_obs()
 
+        self.resize_factor = 100/400.0
+        self.resize_factor_real = 100/650.0
 
-        # Set action and observaation space       
-        self.action_space = spaces.Box(-1., 1., shape=(n_actions,), dtype='float32')
-        self.observation_space = spaces.Dict(dict(
-            desired_goal=spaces.Box(-np.inf, np.inf, shape=obs['achieved_goal'].shape, dtype='float32'),
-            achieved_goal=spaces.Box(-np.inf, np.inf, shape=obs['achieved_goal'].shape, dtype='float32'),
-            observation=spaces.Box(-np.inf, np.inf, shape=obs['observation'].shape, dtype='float32'),     
-
-
-        # For Fetch robot(?)
-        # -------------------------
         self.current_distance = 1
         self.previous_distance = 1
         self.is_reached = False
         self.tf = TransformListener()
 
         self.max_steps = max_steps
-        self.done = False
-        self.reward = 0
         self.reward_rescale = 1.0
         self.is_demo = False
         self.reward_type = 'sparse'
@@ -125,43 +122,36 @@ class RobotEnv(gym.GoalEnv):
 
         self._action_scale = 1.0
 
-
-
-    # Callback function
-    # ----------------------------------    
-    def joint_stateCB(self, msg):
+    # callback function
+    # ----------------------------
+    
+    def joint_state_callback(self, msg):
         """Callback function of joint states subscriber.
 
         Argument: msg
         """
-        global joint_states
-        joint_states = msg
+        self.joints_states = msg
 
-        self.joints_name = joint_states.name
-        self.joints_position = joint_states.position
-        self.joints_velocity = joint_states.velocity
-        self.joint_effort = joint_states.effort
-
-        # print(joint_states.position)
+        self.joints_name = self.joints_states.name
+        self.joints_position = self.joints_states.position
+        self.joints_velocity = self.joints_states.velocity
+        self.joints_effort = self.joints_states.effort
 
 
-    def kinematics_poseCB(self, msg):
+    def kinematics_pose_callback(self, msg):
         """Callback function of gripper kinematic pose subscriber.
 
         Argument: msg
         """        
-        global kinematics_pose
-        kinematics_pose = msg
-        self.gripper_position = kinematics_pose.pose.position
-        self.gripper_orientiation = kinematics_pose.pose.orientation
-
-        print(self.gripper_position)
-        print(self.gripper_orientiation)
+        self.kinematics_pose = msg
+        self.gripper_position = self.kinematics_pose.pose.position
+        self.gripper_orientiation = self.kinematics_pose.pose.orientation
 
 
-    # Get and Set function
-    # ----------------------------------
-    def get_current_joints_states(self):
+    # get and set function
+    # ----------------------------
+
+    def get_joints_states(self):
         """Returns current joints states of robot including position, velocity, effort
 
         Returns: Float64[] self.joints_position, self.joints_velocity, self.joint_effort
@@ -177,15 +167,20 @@ class RobotEnv(gym.GoalEnv):
         return self.gripper_position, self.gripper_orientiation
 
 
+    def get_gripper_position(self):
+        """Returns gripper end effector position
+
+        Returns: Pose().position
+        """      
+        return self.gripper_position
+
+
     def set_joints_position(self, joints_angles):
         """Move joints using joint position command publishers.
         
         Argument: joints_position_cmd
         self.joints_position_cmd = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         """
-        self.joints_position = joints_angles
-        self.joints_position[4] = 5.0
-        
         rate = rospy.Rate(10) # 10hz 
         while not rospy.is_shutdown():
             rospy.loginfo(self.joints_position)
@@ -197,138 +192,24 @@ class RobotEnv(gym.GoalEnv):
             self.pub_joint4_position.publish(self.joints_position[5])            
             rate.sleep()
 
-    # Redefine later
-    def get_distance(self):
-        DIST_OFFSET = -0.9+0.025-0.0375
-        rospy.wait_for_service('/gazebo/get_model_state')
-        try:
-            object_state_srv = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
-            object_state = object_state_srv("block", "world")
-            self.destPos = np.array([object_state.pose.position.x, object_state.pose.position.y, object_state.pose.position.z + DIST_OFFSET])
-        except rospy.ServiceException as e:
-            rospy.logerr("Spawn URDF service call failed: {0}".format(e))        
-        self.position = self.getCurrentPose()
-        currentPos = np.array((self.position[0],self.position[1],self.position[2]))        
-        return np.linalg.norm(currentPos-self.destPos)
 
-
+    # gazebo simulation function
+    # ----------------------------
     def unpause_sim(self):
         self.gazebo.unpauseSim()
 
+
     def pause_sim(self):
-        self.gazebo.pauseSim()        
-
-    # GoalEnv methods
-    # ----------------------------------
-    def compute_reward(self, observations, done):
-        return reward    
+        self.gazebo.pauseSim()           
 
 
-    # Reinforcement Learning util function
-    # ----------------------------------
-    def _set_action(self, action):
-        """Applies the given action to the simulation.
-        OpenAI gym style function
-        Set action to move joints.
-
-        Arguments: action
-        """
-
-
-    def _set_velocity_action(self, action):
-        """Applies the given action to the simulation.
-        OpenAI gym style function
-        Set action to move joints.
-
-        Arguments: action
-        """
-        self.vel_ctrl = VelocityController()
-        self.vel_ctrl.calc_joint_vel()
-
-
-    def _set_cartesian_action(self, action):
-        self.cartesian_command = action
-
-
-    def _get_obs(self):
-        """Returns the observations.
-        OpenAI gym style function.
-        Get observations from robot state.
-
-        Returns: obs
-        """
-        self.obs_joints_position, self.obs_joints_velocity, self.obs_joints_effort  = self.get_current_joints_states()
-        obs = [self.obs_joints_position, self.obs_joints_velocity, self.obs_joints_effort]
-        return obs
-
-
-    def _get_joint_obs(self):
-        """Returns the joints states including position, velocity, effort.
-        Using _get_joints_obs() instead of openai gym style function _get_obs().
-
-        Returns: Float64 obs_joints_position, obs_joints_velocity, obs_joints_effort
-        """
-        self.obs_joints_position, self.obs_joints_velocity, self.obs_joints_effort  = self.get_current_joints_states()
-        while not self.obs_joints_position:
-            print('waiting joint vals')
-            self.obs_joints_position, self.obs_joints_velocity, self.obs_joints_effort  = self.get_current_joints_states()
-
-        return self.obs_joints_position, self.obs_joints_velocity, self.obs_joints_effort
-
-
-    
-    def _get_target_obj_obs(self):
-        """Returns the target object pose. Experimentally supports only position info.
-
-        Returns: Pose() destPos
-        """
-        self.goal_pub = GoalPublisher()
-        self.destPos = self.goal_pub.goal_publisher
-
-        return self.destPos
-
-'''
-    def apply_action(self, cartesian):
-        self.cartesian = cartesian
-        ik_pose = Pose()  # inverse kinematics pose
-        ik_pose.position.x = cartesian[0]
-        ik_pose.position.y = cartesian[1]
-        ik_pose.position.z = cartesian[2]
-        ik_pose.orientation.x = self.fixed_orientation.x
-        ik_pose.orientation.y = self.fixed_orientation.y
-        ik_pose.orientation.z = self.fixed_orientation.z
-        ik_pose.orientation.w = self.fixed_orientation.w
-        self.servo_to_pose(ik_pose)
-
-
-    def servo_to_pose(self, pose, time=1.0, steps=1.0):
-        """Lineary-interpolated Cartesian move
-        """
-        rate = rospy.Rate(1/(time/steps)) # Defaults to 100Hz command rate
-        self.current_position = self.gripper_position
-        self.ik_delta = Pose()
-        self.ik_delta.position.x = pose.position.x / steps + self.gripper_position.x
-        self.ik_delta.position.y = pose.position.x / steps + self.gripper_position.x
-        self.ik_delta.position.z = pose.position.x / steps + self.gripper_position.x
-        # self.ik_delta.orientation.x = (pose.orientation.x) / steps
-        # self.ik_delta.orientation.y = (pose.orientation.y) / steps
-        # self.ik_delta.orientation.z = (pose.orientation.z) / steps
-        # self.ik_delta.orientation.w = (pose.orientation.w) / steps
-        self.vel_ctrl = VelocityController()
-        self.vel_ctrl.calc_joint_vel()
-
-        # self.joints_angles = []
-        # if self.joint_angles:
-        #     self.set_joints_position(self.joints_angles)
-'''
-
-    # Env methods
+    # gym Env methods
     # ----------------------------
     def _seed(self, seed=None): #overriden function
         self.np_random, seed = seeding.np_random(seed)
-        return [seed]
+        return [seed]    
     
-    # Redefine later    
+
     def _step(self, action):#overriden function
         """
         Function executed each time step.
@@ -366,76 +247,72 @@ class RobotEnv(gym.GoalEnv):
 
         obs = [joint_pos, joint_vels, joint_effos]
 
-        return obs, self.reward_rescale*self.reward, self.done
+        return obs, self.reward_rescale * self.reward, self.done
 
 
-    # Redefine later
     def _reset(self):
         # Attempt to reset the simulator. Since we randomize initial conditions, it
         # is possible to get into a state with numerical issues (e.g. due to penetration or
         # Gimbel lock) or we may not achieve an initial condition (e.g. an object is within the hand).
         # In this case, we just keep randomizing until we eventually achieve a valid initial
         # configuration.
-        did_reset_sim = False
-        while not did_reset_sim:
-            did_reset_sim = self._reset_sim()
-        self.goal = self._sample_goal().copy()
-        obs = self._get_obs()
-        return obs        
+        self.done = False
+        self.successCount =0
+        self.terminateCount =0
+        self.reward = 0
+
+        self.joints_position, self.joints_velocity, self.joints_effort = self._get_joint_obs()
+        self.obj_position = self._get_target_obj_obs()
+
+        obs = self.joints_position, self.joints_velocity, self.joints_effort
+
+        return obs
 
 
     def _close(self):
         rospy.signal_shutdown("done")
 
-    # Redefine later
-    def reset_teaching(self):
-        """OpenAI Gym style reset function.
-           Will be used for demo data acquisition."""        
 
-    # Redefine later
-    def step_teaching(self,step):
+    def _set_velocity_action(self, action):
+        """Applies the given action to the simulation.
+        OpenAI gym style function
+        Set action to move joints.
 
-    # Redefine later 
-    def _is_success(self, achieved_goal, desired_goal):
-        """Indicates whether or not the achieved goal successfully achieved the desired goal.
+        Arguments: action
         """
-        raise NotImplementedError()
+        self.vel_ctrl = VelocityController()
+        self.vel_ctrl.ref_pose_cb(action)
+        self.vel_ctrl.calc_joint_vel()
 
-    # Redefine later 
-    def _sample_goal(self):
-        """Samples a new goal and returns it.
+
+    def _set_cartesian_action(self, action):
+        self.cartesian_command = action
+
+
+    def _get_joint_obs(self):
+        """Returns the joints states including position, velocity, effort.
+        Using _get_joints_obs() instead of openai gym style function _get_obs().
+
+        Returns: Float64 obs_joints_position, obs_joints_velocity, obs_joints_effort
         """
-        if self.has_object:
-            goal = self.initial_gripper_xpos[:3] + self.np_random.uniform(-self.target_range, self.target_range, size=3)
-            goal += self.target_offset
-            goal[2] = self.height_offset
-            if self.target_in_the_air and self.np_random.uniform() < 0.5:
-                goal[2] += self.np_random.uniform(0, 0.45)
-        else:
-            goal = self.initial_gripper_xpos[:3] + self.np_random.uniform(-0.15, 0.15, size=3)
-        return goal.copy()
+        self.obs_joints_position, self.obs_joints_velocity, self.obs_joints_effort  = self.get_current_joints_states()
+        while not self.obs_joints_position:
+            print('waiting joint vals')
+            self.obs_joints_position, self.obs_joints_velocity, self.obs_joints_effort  = self.get_current_joints_states()
 
-    # Redefine later     
-    def _env_setup(self):
+        return self.obs_joints_position, self.obs_joints_velocity, self.obs_joints_effort
+
+
+    def _get_target_obj_obs(self):
+        """Returns the target object pose. Experimentally supports only position info.
+
+        Returns: Pose() destPos
         """
-        Inits variables needed to be initialised each time we reset at the start
-        of an episode.
-        :return:
-        """
-    def _is_done(self, observations):
-        print("Done")
-        self.done = True
-        return done
+        self.goal_pub = GoalPublisher()
+        self.destPos = self.goal_pub.goal_publisher
 
-    # Redefine later
-    # def _render(self):
+        return self.destPos
 
-    # Redefine later
-    # def _get_viewer(self, mode): 
-
-
-    # Other methods
-    # ----------------------------------
 
     def _reset_sim(self):
         """Resets a simulation and indicates whether or not it was successful.
@@ -443,17 +320,7 @@ class RobotEnv(gym.GoalEnv):
         simulation), this method should indicate such a failure by returning False.
         In such a case, this method will be called again to attempt a the reset again.
         """
-       if self.is_dagger:
-            print ('All demo trajectories are collected for this EPISODE')
-            rospy.set_param('dagger_reset',"true") # param_name, param_value        
-            print ('Waiting for new episode to start')        
-            while not rospy.is_shutdown():
-                if rospy.has_param('epi_start'):
-                    break                    
-            rospy.delete_param('epi_start')   
-            print ('Now starts new eisode')
-        else:
-            rospy.set_param('ddpg_reset',"true") # param_name, param_value
+        rospy.set_param('ddpg_reset',"true") # param_name, param_value
             print ('Reset param published')
             print ('Now moves to start position')
             # _color_obs = self.getColor_observation()
@@ -466,8 +333,6 @@ class RobotEnv(gym.GoalEnv):
             print ('Now starts new eisode')
 
 
-
-    # Redefine later
     def check_for_termination(self):
         """Termination triggers done=True
         """
@@ -484,7 +349,7 @@ class RobotEnv(gym.GoalEnv):
         else:
             return False
 
-    # Redefine later
+
     def check_for_success(self):
         """Success triggers done=True
         """
@@ -499,7 +364,40 @@ class RobotEnv(gym.GoalEnv):
             return False
 
 
-# Redefine later 
-if __name__ == "__main__":
-    robot = RobotEnv()
-    rospy.spin()
+    def compute_reward(self):
+        """ Reward computation for non-goalEnv.
+        """
+        curDist = self.getDist()
+        if self.reward_type == 'sparse':
+            return (curDist <= self.distance_threshold).astype(np.float32) # 1 for success else 0
+        else:
+            return -curDist -self.squared_sum_vel # -L2 distance -l2_norm(joint_vels)
+    
+
+    def getDist(self):
+        DIST_OFFSET = -0.9+0.025-0.0375
+        rospy.wait_for_service('/gazebo/get_model_state')
+        try:
+            object_state_srv = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
+            object_state = object_state_srv("block", "world")
+            self.destPos = np.array([object_state.pose.position.x, object_state.pose.position.y, object_state.pose.position.z + DIST_OFFSET])
+        except rospy.ServiceException as e:
+            rospy.logerr("Spawn URDF service call failed: {0}".format(e))        
+        self.position = self.get_gripper_position()
+        currentPos = np.array((self.position[0],self.position[1],self.position[2]))        
+
+
+    # GoalEnv methods
+    # ----------------------------
+    def compute_goal_reward(self, achieved_goal, desired_goal, info):
+        # Compute distance between goal and the achieved goal.
+        d = goal_distance(achieved_goal, desired_goal)
+        if self.reward_type == 'sparse':
+            return -(d > self.distance_threshold).astype(np.float32)
+        else:
+            return -d
+
+
+    def goal_distance(goal_a, goal_b):
+        assert goal_a.shape == goal_b.shape
+        return np.linalg.norm(goal_a - goal_b, axis=-1)

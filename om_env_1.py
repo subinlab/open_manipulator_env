@@ -343,3 +343,4 @@ class RobotEnv(gym.GoalEnv):
         to enforce additional constraints on the simulation state.
         """
         pass
+
